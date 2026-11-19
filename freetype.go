@@ -31,12 +31,14 @@ const (
 
 // An entry in the glyph cache is keyed explicitly by the glyph index and
 // implicitly by the quantized x and y fractional offset. It maps to a mask
-// image and an offset.
+// image and an offset. outlineMask is the mask for the glyph's outline, or
+// nil if outlining is disabled. It shares mask's bounds and offset.
 type cacheEntry struct {
 	valid        bool
 	glyph        truetype.Index
 	advanceWidth fixed.Int26_6
 	mask         *image.Alpha
+	outlineMask  *image.Alpha
 	offset       image.Point
 }
 
@@ -71,6 +73,14 @@ type Context struct {
 	fontSize, dpi float64
 	scale         fixed.Int26_6
 	hinting       font.Hinting
+	// outlineWidth is the outline width in points. outlineScale is that
+	// width in 26.6 fixed point pixels, clamped to be non-negative. A zero
+	// outlineScale disables outlining. outlineSrc is the source image for
+	// the outline and outlineJoin is the join style for the stroke.
+	outlineWidth float64
+	outlineScale fixed.Int26_6
+	outlineSrc   image.Image
+	outlineJoin  raster.Joiner
 	// cache is the glyph cache.
 	cache [nGlyphs * nXFractions * nYFractions]cacheEntry
 }
@@ -81,8 +91,9 @@ func (c *Context) PointToFixed(x float64) fixed.Int26_6 {
 	return fixed.Int26_6(x * float64(c.dpi) * (64.0 / 72.0))
 }
 
-// drawContour draws the given closed contour with the given offset.
-func (c *Context) drawContour(ps []truetype.Point, dx, dy fixed.Int26_6) {
+// drawContour adds the given closed contour to the given Adder, with the
+// given offset.
+func drawContour(a raster.Adder, ps []truetype.Point, dx, dy fixed.Int26_6) {
 	if len(ps) == 0 {
 		return
 	}
@@ -120,7 +131,7 @@ func (c *Context) drawContour(ps []truetype.Point, dx, dy fixed.Int26_6) {
 			others = ps
 		}
 	}
-	c.r.Start(start)
+	a.Start(start)
 	q0, on0 := start, true
 	for _, p := range others {
 		q := fixed.Point26_6{
@@ -130,9 +141,9 @@ func (c *Context) drawContour(ps []truetype.Point, dx, dy fixed.Int26_6) {
 		on := p.Flags&0x01 != 0
 		if on {
 			if on0 {
-				c.r.Add1(q)
+				a.Add1(q)
 			} else {
-				c.r.Add2(q0, q)
+				a.Add2(q0, q)
 			}
 		} else {
 			if on0 {
@@ -142,35 +153,49 @@ func (c *Context) drawContour(ps []truetype.Point, dx, dy fixed.Int26_6) {
 					X: (q0.X + q.X) / 2,
 					Y: (q0.Y + q.Y) / 2,
 				}
-				c.r.Add2(q0, mid)
+				a.Add2(q0, mid)
 			}
 		}
 		q0, on0 = q, on
 	}
 	// Close the curve.
 	if on0 {
-		c.r.Add1(start)
+		a.Add1(start)
 	} else {
-		c.r.Add2(q0, start)
+		a.Add2(q0, start)
 	}
 }
 
+// outlineExpand returns how far the outline can extend beyond the glyph's
+// bounding box, in 26.6 fixed point units, including one pixel of slack for
+// rounding. It is zero when outlining is disabled.
+func (c *Context) outlineExpand() fixed.Int26_6 {
+	if c.outlineScale <= 0 {
+		return 0
+	}
+	return c.outlineScale + 64
+}
+
 // rasterize returns the advance width, glyph mask and integer-pixel offset
-// to render the given glyph at the given sub-pixel offsets.
+// to render the given glyph at the given sub-pixel offsets, plus the glyph's
+// outline mask (or nil if outlining is disabled). The outline mask shares
+// the fill mask's bounds and offset.
 // The 26.6 fixed point arguments fx and fy must be in the range [0, 1).
 func (c *Context) rasterize(glyph truetype.Index, fx, fy fixed.Int26_6) (
-	fixed.Int26_6, *image.Alpha, image.Point, error) {
+	fixed.Int26_6, *image.Alpha, *image.Alpha, image.Point, error) {
 
 	if err := c.glyphBuf.Load(c.f, c.scale, glyph, c.hinting); err != nil {
-		return 0, nil, image.Point{}, err
+		return 0, nil, nil, image.Point{}, err
 	}
-	// Calculate the integer-pixel bounds for the glyph.
-	xmin := int(fx+c.glyphBuf.Bounds.Min.X) >> 6
-	ymin := int(fy-c.glyphBuf.Bounds.Max.Y) >> 6
-	xmax := int(fx+c.glyphBuf.Bounds.Max.X+0x3f) >> 6
-	ymax := int(fy-c.glyphBuf.Bounds.Min.Y+0x3f) >> 6
+	// Calculate the integer-pixel bounds for the glyph, expanded by the
+	// outline width so that the outline is not clipped.
+	expand := c.outlineExpand()
+	xmin := int(fx+c.glyphBuf.Bounds.Min.X-expand) >> 6
+	ymin := int(fy-c.glyphBuf.Bounds.Max.Y-expand) >> 6
+	xmax := int(fx+c.glyphBuf.Bounds.Max.X+expand+0x3f) >> 6
+	ymax := int(fy-c.glyphBuf.Bounds.Min.Y+expand+0x3f) >> 6
 	if xmin > xmax || ymin > ymax {
-		return 0, nil, image.Point{}, errors.New("freetype: negative sized glyph")
+		return 0, nil, nil, image.Point{}, errors.New("freetype: negative sized glyph")
 	}
 	// A TrueType's glyph's nodes can have negative co-ordinates, but the
 	// rasterizer clips anything left of x=0 or above y=0. xmin and ymin are
@@ -183,20 +208,40 @@ func (c *Context) rasterize(glyph truetype.Index, fx, fy fixed.Int26_6) (
 	c.r.Clear()
 	e0 := 0
 	for _, e1 := range c.glyphBuf.Ends {
-		c.drawContour(c.glyphBuf.Points[e0:e1], fx, fy)
+		drawContour(c.r, c.glyphBuf.Points[e0:e1], fx, fy)
 		e0 = e1
 	}
 	a := image.NewAlpha(image.Rect(0, 0, xmax-xmin, ymax-ymin))
 	c.r.Rasterize(raster.NewAlphaSrcPainter(a))
-	return c.glyphBuf.AdvanceWidth, a, image.Point{xmin, ymin}, nil
+	// Rasterize the glyph's outline by stroking the same contours. The
+	// stroke is centered on the contour and twice the outline width, so
+	// that painting the fill over the inner half leaves an outer outline
+	// of the requested width. Stroking follows the contours themselves,
+	// so counters (the holes in 'O', 'B', 'g', etc.) remain holes.
+	var outlineMask *image.Alpha
+	if expand > 0 {
+		var path raster.Path
+		e0 = 0
+		for _, e1 := range c.glyphBuf.Ends {
+			drawContour(&path, c.glyphBuf.Points[e0:e1], fx, fy)
+			e0 = e1
+		}
+		c.r.Clear()
+		raster.Stroke(c.r, path, 2*c.outlineScale, nil, c.outlineJoin)
+		outlineMask = image.NewAlpha(image.Rect(0, 0, xmax-xmin, ymax-ymin))
+		c.r.UseNonZeroWinding = true
+		c.r.Rasterize(raster.NewAlphaSrcPainter(outlineMask))
+		c.r.UseNonZeroWinding = false
+	}
+	return c.glyphBuf.AdvanceWidth, a, outlineMask, image.Point{xmin, ymin}, nil
 }
 
-// glyph returns the advance width, glyph mask and integer-pixel offset to
-// render the given glyph at the given sub-pixel point. It is a cache for the
-// rasterize method. Unlike rasterize, p's co-ordinates do not have to be in
-// the range [0, 1).
+// glyph returns the advance width, glyph mask, outline mask (or nil) and
+// integer-pixel offset to render the given glyph at the given sub-pixel
+// point. It is a cache for the rasterize method. Unlike rasterize, p's
+// co-ordinates do not have to be in the range [0, 1).
 func (c *Context) glyph(glyph truetype.Index, p fixed.Point26_6) (
-	fixed.Int26_6, *image.Alpha, image.Point, error) {
+	fixed.Int26_6, *image.Alpha, *image.Alpha, image.Point, error) {
 
 	// Split p.X and p.Y into their integer and fractional parts.
 	ix, fx := int(p.X>>6), p.X&0x3f
@@ -208,15 +253,15 @@ func (c *Context) glyph(glyph truetype.Index, p fixed.Point26_6) (
 	t := ((tg*nXFractions)+tx)*nYFractions + ty
 	// Check for a cache hit.
 	if e := c.cache[t]; e.valid && e.glyph == glyph {
-		return e.advanceWidth, e.mask, e.offset.Add(image.Point{ix, iy}), nil
+		return e.advanceWidth, e.mask, e.outlineMask, e.offset.Add(image.Point{ix, iy}), nil
 	}
 	// Rasterize the glyph and put the result into the cache.
-	advanceWidth, mask, offset, err := c.rasterize(glyph, fx, fy)
+	advanceWidth, mask, outlineMask, offset, err := c.rasterize(glyph, fx, fy)
 	if err != nil {
-		return 0, nil, image.Point{}, err
+		return 0, nil, nil, image.Point{}, err
 	}
-	c.cache[t] = cacheEntry{true, glyph, advanceWidth, mask, offset}
-	return advanceWidth, mask, offset.Add(image.Point{ix, iy}), nil
+	c.cache[t] = cacheEntry{true, glyph, advanceWidth, mask, outlineMask, offset}
+	return advanceWidth, mask, outlineMask, offset.Add(image.Point{ix, iy}), nil
 }
 
 // DrawString draws s at p and returns p advanced by the text extent. The text
@@ -241,7 +286,7 @@ func (c *Context) DrawString(s string, p fixed.Point26_6) (fixed.Point26_6, erro
 			}
 			p.X += kern
 		}
-		advanceWidth, mask, offset, err := c.glyph(index, p)
+		advanceWidth, mask, outlineMask, offset, err := c.glyph(index, p)
 		if err != nil {
 			return fixed.Point26_6{}, err
 		}
@@ -250,6 +295,11 @@ func (c *Context) DrawString(s string, p fixed.Point26_6) (fixed.Point26_6, erro
 		dr := c.clip.Intersect(glyphRect)
 		if !dr.Empty() {
 			mp := image.Point{0, dr.Min.Y - glyphRect.Min.Y}
+			// Draw the outline first, then the fill on top of it, so that
+			// the fill covers the inner half of the stroke.
+			if outlineMask != nil && c.outlineSrc != nil {
+				draw.DrawMask(c.dst, dr, c.outlineSrc, image.ZP, outlineMask, mp, draw.Over)
+			}
 			draw.DrawMask(c.dst, dr, c.src, image.ZP, mask, mp, draw.Over)
 		}
 		prev, hasPrev = index, true
@@ -257,19 +307,26 @@ func (c *Context) DrawString(s string, p fixed.Point26_6) (fixed.Point26_6, erro
 	return p, nil
 }
 
-// recalc recalculates scale and bounds values from the font size, screen
-// resolution and font metrics, and invalidates the glyph cache.
+// recalc recalculates scale and bounds values from the font size, outline
+// width, screen resolution and font metrics, and invalidates the glyph cache.
 func (c *Context) recalc() {
 	c.scale = fixed.Int26_6(c.fontSize * c.dpi * (64.0 / 72.0))
+	c.outlineScale = fixed.Int26_6(c.outlineWidth * c.dpi * (64.0 / 72.0))
+	if c.outlineScale < 0 {
+		// A negative outline width is equivalent to no outline.
+		c.outlineScale = 0
+	}
 	if c.f == nil {
 		c.r.SetBounds(0, 0)
 	} else {
-		// Set the rasterizer's bounds to be big enough to handle the largest glyph.
+		// Set the rasterizer's bounds to be big enough to handle the largest
+		// glyph, including any outline around it.
+		expand := c.outlineExpand()
 		b := c.f.Bounds(c.scale)
-		xmin := +int(b.Min.X) >> 6
-		ymin := -int(b.Max.Y) >> 6
-		xmax := +int(b.Max.X+63) >> 6
-		ymax := -int(b.Min.Y-63) >> 6
+		xmin := +int(b.Min.X-expand) >> 6
+		ymin := -int(b.Max.Y+expand) >> 6
+		xmax := +int(b.Max.X+expand+63) >> 6
+		ymax := -int(b.Min.Y-expand-63) >> 6
 		c.r.SetBounds(xmax-xmin, ymax-ymin)
 	}
 	for i := range c.cache {
@@ -307,6 +364,40 @@ func (c *Context) SetFontSize(fontSize float64) {
 // SetHinting sets the hinting policy.
 func (c *Context) SetHinting(hinting font.Hinting) {
 	c.hinting = hinting
+	for i := range c.cache {
+		c.cache[i] = cacheEntry{}
+	}
+}
+
+// SetOutlineWidth sets the width of the outline drawn around each glyph, in
+// points (as in "a 12 point font"), scaled by the Context's DPI just like the
+// font size. The outline follows the glyph's contours, so counters (the holes
+// in 'O', 'B', 'g', etc.) remain holes. It is drawn underneath the glyph fill
+// (set by SetSrc) with the source image set by SetOutlineSrc, so the visible
+// outline extends outwards from the glyph's contours by the given width.
+//
+// A zero or negative width disables outlining, which is the default.
+func (c *Context) SetOutlineWidth(width float64) {
+	if c.outlineWidth == width {
+		return
+	}
+	c.outlineWidth = width
+	c.recalc()
+}
+
+// SetOutlineSrc sets the source image for drawing the glyph outline. This is
+// typically an image.Uniform. If it is nil, or the outline width is zero, no
+// outline is drawn. Changing it does not invalidate the glyph cache, since
+// the cached masks are color-independent.
+func (c *Context) SetOutlineSrc(src image.Image) {
+	c.outlineSrc = src
+}
+
+// SetOutlineJoin sets the join style used where two segments of a glyph's
+// contour meet when stroking the outline. A nil joiner means
+// raster.RoundJoiner, which is the default.
+func (c *Context) SetOutlineJoin(j raster.Joiner) {
+	c.outlineJoin = j
 	for i := range c.cache {
 		c.cache[i] = cacheEntry{}
 	}
