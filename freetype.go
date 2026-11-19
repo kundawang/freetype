@@ -71,6 +71,12 @@ type Context struct {
 	fontSize, dpi float64
 	scale         fixed.Int26_6
 	hinting       font.Hinting
+	// lcd is the optional LCD sub-pixel rendering configuration. A nil value
+	// means conventional grayscale rendering. lcdCache is the LCD glyph
+	// cache, kept separate from cache so that the two mask kinds can never
+	// be mixed up.
+	lcd      *LCDConfig
+	lcdCache [nGlyphs * nXFractions * nYFractions]lcdCacheEntry
 	// cache is the glyph cache.
 	cache [nGlyphs * nXFractions * nYFractions]cacheEntry
 }
@@ -232,6 +238,7 @@ func (c *Context) DrawString(s string, p fixed.Point26_6) (fixed.Point26_6, erro
 		return fixed.Point26_6{}, errors.New("freetype: DrawText called with a nil font")
 	}
 	prev, hasPrev := truetype.Index(0), false
+	lcd := c.lcdActive()
 	for _, rune := range s {
 		index := c.f.Index(rune)
 		if hasPrev {
@@ -241,16 +248,27 @@ func (c *Context) DrawString(s string, p fixed.Point26_6) (fixed.Point26_6, erro
 			}
 			p.X += kern
 		}
-		advanceWidth, mask, offset, err := c.glyph(index, p)
-		if err != nil {
-			return fixed.Point26_6{}, err
-		}
-		p.X += advanceWidth
-		glyphRect := mask.Bounds().Add(offset)
-		dr := c.clip.Intersect(glyphRect)
-		if !dr.Empty() {
-			mp := image.Point{0, dr.Min.Y - glyphRect.Min.Y}
-			draw.DrawMask(c.dst, dr, c.src, image.ZP, mask, mp, draw.Over)
+		if lcd {
+			advanceWidth, lcdMask, offset, err := c.glyphLCD(index, p)
+			if err != nil {
+				return fixed.Point26_6{}, err
+			}
+			p.X += advanceWidth
+			if lcdMask != nil {
+				c.drawLCDMask(lcdMask, offset)
+			}
+		} else {
+			advanceWidth, mask, offset, err := c.glyph(index, p)
+			if err != nil {
+				return fixed.Point26_6{}, err
+			}
+			p.X += advanceWidth
+			glyphRect := mask.Bounds().Add(offset)
+			dr := c.clip.Intersect(glyphRect)
+			if !dr.Empty() {
+				mp := image.Point{0, dr.Min.Y - glyphRect.Min.Y}
+				draw.DrawMask(c.dst, dr, c.src, image.ZP, mask, mp, draw.Over)
+			}
 		}
 		prev, hasPrev = index, true
 	}
@@ -270,10 +288,19 @@ func (c *Context) recalc() {
 		ymin := -int(b.Max.Y) >> 6
 		xmax := +int(b.Max.X+63) >> 6
 		ymax := -int(b.Min.Y-63) >> 6
+		// LCD rasterization shifts the outline by up to 2/3 of a pixel and
+		// combines three passes whose masks may differ by one pixel in width.
+		// Two extra columns keep every shifted outline inside the bounds.
+		if c.lcd != nil {
+			xmax += 2
+		}
 		c.r.SetBounds(xmax-xmin, ymax-ymin)
 	}
 	for i := range c.cache {
 		c.cache[i] = cacheEntry{}
+	}
+	for i := range c.lcdCache {
+		c.lcdCache[i] = lcdCacheEntry{}
 	}
 }
 
@@ -310,6 +337,39 @@ func (c *Context) SetHinting(hinting font.Hinting) {
 	for i := range c.cache {
 		c.cache[i] = cacheEntry{}
 	}
+	for i := range c.lcdCache {
+		c.lcdCache[i] = lcdCacheEntry{}
+	}
+}
+
+// LCD returns the current LCD sub-pixel configuration, or nil if LCD
+// rendering is disabled.
+func (c *Context) LCD() *LCDConfig {
+	return c.lcd
+}
+
+// SetLCD enables, reconfigures or disables LCD sub-pixel rendering. Passing
+// nil restores the default grayscale rendering. The configuration is
+// validated before it is applied, so an invalid configuration leaves the
+// Context unchanged.
+func (c *Context) SetLCD(cfg *LCDConfig) error {
+	if cfg == nil {
+		c.lcd = nil
+		c.recalc()
+		return nil
+	}
+	if err := cfg.validate(); err != nil {
+		return err
+	}
+	// Keep a copy so later mutation of the caller's struct (in particular
+	// FilterWeights) cannot invalidate cached masks.
+	cp := *cfg
+	if cfg.FilterWeights != nil {
+		cp.FilterWeights = append([]int(nil), cfg.FilterWeights...)
+	}
+	c.lcd = &cp
+	c.recalc()
+	return nil
 }
 
 // SetDst sets the destination image for draw operations.
